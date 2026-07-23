@@ -144,14 +144,9 @@ class LoRATrainingOrchestrator:
 
     def _load_model(self) -> PeftModel:
         """Load the frozen base model and attach a trainable LoRA adapter."""
-        model_kwargs: dict[str, Any] = {}
-        selected_dtype = self._select_torch_dtype()
-        if selected_dtype is not None:
-            model_kwargs['torch_dtype'] = selected_dtype
-
         model = AutoModelForCausalLM.from_pretrained(
             self._training_settings.base_model_name,
-            **model_kwargs,
+            **self._build_model_loading_kwargs(),
         )
         if self._training_settings.gradient_checkpointing:
             model.gradient_checkpointing_enable()
@@ -169,6 +164,21 @@ class LoRATrainingOrchestrator:
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
         return model
+
+    def _build_model_loading_kwargs(self) -> dict[str, Any]:
+        """Build model loading kwargs for the installed Transformers API."""
+        signature = inspect.signature(AutoModelForCausalLM.from_pretrained)
+        supported_args = set(signature.parameters)
+        selected_dtype = self._select_torch_dtype()
+        kwargs: dict[str, Any] = {}
+
+        if selected_dtype is not None:
+            if 'dtype' in supported_args:
+                kwargs['dtype'] = selected_dtype
+            else:
+                kwargs['torch_dtype'] = selected_dtype
+
+        return kwargs
 
     def _select_torch_dtype(self) -> torch.dtype | None:
         """Resolve the desired model loading dtype from training precision flags."""
@@ -212,21 +222,37 @@ class LoRATrainingOrchestrator:
     ) -> Trainer:
         """Create the Hugging Face trainer configured for LoRA fine-tuning."""
         args = TrainingArguments(**self._build_training_arguments_kwargs(run_paths))
-        collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding=True)
-        return Trainer(
-            model=model,
-            args=args,
-            train_dataset=datasets['train'],
-            eval_dataset=datasets['validation'],
+        collator = DataCollatorForSeq2Seq(
             tokenizer=tokenizer,
-            data_collator=collator,
+            model=model,
+            padding=True,
+            label_pad_token_id=-100,
         )
+
+        trainer_kwargs: dict[str, Any] = {
+            'model': model,
+            'args': args,
+            'train_dataset': datasets['train'],
+            'eval_dataset': datasets['validation'],
+            'data_collator': collator,
+        }
+
+        trainer_signature = inspect.signature(Trainer.__init__)
+        supported_args = set(trainer_signature.parameters)
+        if 'processing_class' in supported_args:
+            trainer_kwargs['processing_class'] = tokenizer
+        elif 'tokenizer' in supported_args:
+            trainer_kwargs['tokenizer'] = tokenizer
+
+        return Trainer(**trainer_kwargs)
 
     def _build_training_arguments_kwargs(self, run_paths: dict[str, Path]) -> dict[str, Any]:
         """Build TrainingArguments kwargs that match the installed Transformers API."""
         signature = inspect.signature(TrainingArguments.__init__)
         supported_args = set(signature.parameters)
         evaluation_enabled = self._training_settings.evaluation_strategy != 'no'
+        steps_evaluation = self._training_settings.evaluation_strategy == 'steps'
+        steps_saving = self._training_settings.save_strategy == 'steps'
 
         args: dict[str, Any] = {
             'output_dir': str(run_paths['output_dir']),
@@ -238,9 +264,7 @@ class LoRATrainingOrchestrator:
             'weight_decay': self._training_settings.weight_decay,
             'warmup_ratio': self._training_settings.warmup_ratio,
             'logging_steps': self._training_settings.logging_steps,
-            'eval_steps': self._training_settings.eval_steps,
             'save_strategy': self._training_settings.save_strategy,
-            'save_steps': self._training_settings.save_steps,
             'save_total_limit': self._training_settings.save_total_limit,
             'seed': self._training_settings.seed,
             'bf16': self._training_settings.bf16,
@@ -252,6 +276,8 @@ class LoRATrainingOrchestrator:
             'logging_dir': str(run_paths['log_dir']),
             'load_best_model_at_end': evaluation_enabled,
             'metric_for_best_model': 'eval_loss',
+            'greater_is_better': False,
+            'save_safetensors': True,
         }
 
         if 'eval_strategy' in supported_args:
@@ -259,11 +285,23 @@ class LoRATrainingOrchestrator:
         elif 'evaluation_strategy' in supported_args:
             args['evaluation_strategy'] = self._training_settings.evaluation_strategy
 
+        if steps_evaluation:
+            args['eval_steps'] = self._training_settings.eval_steps
+        if steps_saving:
+            args['save_steps'] = self._training_settings.save_steps
+        if evaluation_enabled:
+            args['do_eval'] = True
+        if 'do_train' in supported_args:
+            args['do_train'] = True
+
         if 'overwrite_output_dir' in supported_args:
             # Run directories are unique and timestamped, so overwrite remains safe when supported.
             args['overwrite_output_dir'] = True
 
-        return args
+        if 'logging_strategy' in supported_args:
+            args['logging_strategy'] = 'steps'
+
+        return {key: value for key, value in args.items() if key in supported_args}
 
     def _build_summary(
         self,
