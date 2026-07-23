@@ -1,7 +1,8 @@
-﻿"""Training orchestration for LoRA fine-tuning."""
+"""Training orchestration for LoRA fine-tuning."""
 
 from __future__ import annotations
 
+import inspect
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -143,9 +144,14 @@ class LoRATrainingOrchestrator:
 
     def _load_model(self) -> PeftModel:
         """Load the frozen base model and attach a trainable LoRA adapter."""
+        model_kwargs: dict[str, Any] = {}
+        selected_dtype = self._select_torch_dtype()
+        if selected_dtype is not None:
+            model_kwargs['torch_dtype'] = selected_dtype
+
         model = AutoModelForCausalLM.from_pretrained(
             self._training_settings.base_model_name,
-            torch_dtype=torch.bfloat16 if self._training_settings.bf16 else None,
+            **model_kwargs,
         )
         if self._training_settings.gradient_checkpointing:
             model.gradient_checkpointing_enable()
@@ -163,6 +169,14 @@ class LoRATrainingOrchestrator:
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
         return model
+
+    def _select_torch_dtype(self) -> torch.dtype | None:
+        """Resolve the desired model loading dtype from training precision flags."""
+        if self._training_settings.fp16:
+            return torch.float16
+        if self._training_settings.bf16:
+            return torch.bfloat16
+        return None
 
     def _prepare_split(self, dataset: Dataset, tokenizer: PreTrainedTokenizerBase) -> Dataset:
         """Format and tokenize one dataset split."""
@@ -197,33 +211,7 @@ class LoRATrainingOrchestrator:
         run_paths: dict[str, Path],
     ) -> Trainer:
         """Create the Hugging Face trainer configured for LoRA fine-tuning."""
-        args = TrainingArguments(
-            output_dir=str(run_paths['output_dir']),
-            overwrite_output_dir=True,
-            num_train_epochs=self._training_settings.num_train_epochs,
-            per_device_train_batch_size=self._training_settings.per_device_train_batch_size,
-            per_device_eval_batch_size=self._training_settings.per_device_eval_batch_size,
-            gradient_accumulation_steps=self._training_settings.gradient_accumulation_steps,
-            learning_rate=self._training_settings.learning_rate,
-            weight_decay=self._training_settings.weight_decay,
-            warmup_ratio=self._training_settings.warmup_ratio,
-            logging_steps=self._training_settings.logging_steps,
-            evaluation_strategy=self._training_settings.evaluation_strategy,
-            eval_steps=self._training_settings.eval_steps,
-            save_strategy=self._training_settings.save_strategy,
-            save_steps=self._training_settings.save_steps,
-            save_total_limit=self._training_settings.save_total_limit,
-            seed=self._training_settings.seed,
-            bf16=self._training_settings.bf16,
-            fp16=self._training_settings.fp16,
-            gradient_checkpointing=self._training_settings.gradient_checkpointing,
-            max_grad_norm=self._training_settings.max_grad_norm,
-            lr_scheduler_type=self._training_settings.lr_scheduler_type,
-            report_to=self._training_settings.report_to,
-            logging_dir=str(run_paths['log_dir']),
-            load_best_model_at_end=self._training_settings.evaluation_strategy != 'no',
-            metric_for_best_model='eval_loss',
-        )
+        args = TrainingArguments(**self._build_training_arguments_kwargs(run_paths))
         collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding=True)
         return Trainer(
             model=model,
@@ -233,6 +221,49 @@ class LoRATrainingOrchestrator:
             tokenizer=tokenizer,
             data_collator=collator,
         )
+
+    def _build_training_arguments_kwargs(self, run_paths: dict[str, Path]) -> dict[str, Any]:
+        """Build TrainingArguments kwargs that match the installed Transformers API."""
+        signature = inspect.signature(TrainingArguments.__init__)
+        supported_args = set(signature.parameters)
+        evaluation_enabled = self._training_settings.evaluation_strategy != 'no'
+
+        args: dict[str, Any] = {
+            'output_dir': str(run_paths['output_dir']),
+            'num_train_epochs': self._training_settings.num_train_epochs,
+            'per_device_train_batch_size': self._training_settings.per_device_train_batch_size,
+            'per_device_eval_batch_size': self._training_settings.per_device_eval_batch_size,
+            'gradient_accumulation_steps': self._training_settings.gradient_accumulation_steps,
+            'learning_rate': self._training_settings.learning_rate,
+            'weight_decay': self._training_settings.weight_decay,
+            'warmup_ratio': self._training_settings.warmup_ratio,
+            'logging_steps': self._training_settings.logging_steps,
+            'eval_steps': self._training_settings.eval_steps,
+            'save_strategy': self._training_settings.save_strategy,
+            'save_steps': self._training_settings.save_steps,
+            'save_total_limit': self._training_settings.save_total_limit,
+            'seed': self._training_settings.seed,
+            'bf16': self._training_settings.bf16,
+            'fp16': self._training_settings.fp16,
+            'gradient_checkpointing': self._training_settings.gradient_checkpointing,
+            'max_grad_norm': self._training_settings.max_grad_norm,
+            'lr_scheduler_type': self._training_settings.lr_scheduler_type,
+            'report_to': self._training_settings.report_to,
+            'logging_dir': str(run_paths['log_dir']),
+            'load_best_model_at_end': evaluation_enabled,
+            'metric_for_best_model': 'eval_loss',
+        }
+
+        if 'eval_strategy' in supported_args:
+            args['eval_strategy'] = self._training_settings.evaluation_strategy
+        elif 'evaluation_strategy' in supported_args:
+            args['evaluation_strategy'] = self._training_settings.evaluation_strategy
+
+        if 'overwrite_output_dir' in supported_args:
+            # Run directories are unique and timestamped, so overwrite remains safe when supported.
+            args['overwrite_output_dir'] = True
+
+        return args
 
     def _build_summary(
         self,
